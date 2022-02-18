@@ -123,6 +123,45 @@ class ModelArguments:
         }
     )
 
+    # Joey: integrate from linguistic style transfer
+    label_smoothing: float = field(
+        default=0.1,
+        metadata={
+            "help": "Smooth the label"
+        }
+    )
+    # Joey: determine the size
+    # Bert output size is 768
+    style_size: int = field(
+        default=128,
+        metadata={
+            "help": "Size of the style embedding"
+        }
+    )
+    content_size: int = field(
+        default=640,
+        metadata={
+            "help": "Size of the content embedding"
+        }
+    )
+    POS_vocab_size: int = field(
+        default=17, # number from pretrained model: "vblagoje/bert-english-uncased-finetuned-pos"
+        metadata={
+            "help": "How many different POS elements"
+        }
+    )
+    BOW_vocab_size: int = field(
+        default=50265, # number from tokenizer.vocab_size
+        metadata={
+            "help": "How many different words in vocabulary"
+        }
+    )
+    epsilon: float = field(
+        default=1e-8, # number from linguistic-style-transfer
+        metadata={
+            "help": "A small value used in entropy calculation to prevent log(0)"
+        }
+    )
 
 @dataclass
 class DataTrainingArguments:
@@ -269,6 +308,7 @@ def main():
 
     # Setup logging
     logging.basicConfig(
+        filename= training_args.output_dir + '/log.txt',
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO if is_main_process(training_args.local_rank) else logging.WARN,
@@ -382,16 +422,16 @@ def main():
     # Prepare features
     column_names = datasets["train"].column_names
     sent2_cname = None
-    if len(column_names) == 2:
+    if len(column_names) == 3:
         # Pair datasets
         sent0_cname = column_names[0]
         sent1_cname = column_names[1]
-    elif len(column_names) == 3:
+    elif len(column_names) == 4:
         # Pair datasets with hard negatives
         sent0_cname = column_names[0]
         sent1_cname = column_names[1]
         sent2_cname = column_names[2]
-    elif len(column_names) == 1:
+    elif len(column_names) == 2:
         # Unsupervised datasets
         sent0_cname = column_names[0]
         sent1_cname = column_names[0]
@@ -446,7 +486,7 @@ def main():
             prepare_features,
             batched=True,
             num_proc=data_args.preprocessing_num_workers,
-            remove_columns=column_names,
+            remove_columns=column_names.remove('pos_labels'),
             load_from_cache_file=not data_args.overwrite_cache,
         )
 
@@ -462,6 +502,7 @@ def main():
         mlm_probability: float = data_args.mlm_probability
 
         def __call__(self, features: List[Dict[str, Union[List[int], List[List[int]], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+            # Joey: should also return POS_label and BOW_label
             special_keys = ['input_ids', 'attention_mask', 'token_type_ids', 'mlm_input_ids', 'mlm_labels']
             bs = len(features)
             if bs > 0:
@@ -469,10 +510,19 @@ def main():
             else:
                 return
             flat_features = []
+            pos_labels = []
             for feature in features:
                 for i in range(num_sent):
-                    flat_features.append({k: feature[k][i] if k in special_keys else feature[k] for k in feature})
-
+                    flat_feature = {}
+                    for k in feature:
+                        if k == 'pos_labels':
+                            if i == 0:
+                                pos_labels.append([eval(feature[k]), eval(feature[k])])
+                        elif k in special_keys:
+                            flat_feature[k] = feature[k][i]
+                        else:
+                            flat_feature[k] = feature[k]
+                    flat_features.append(flat_feature)
             batch = self.tokenizer.pad(
                 flat_features,
                 padding=self.padding,
@@ -491,6 +541,8 @@ def main():
             if "label_ids" in batch:
                 batch["labels"] = batch["label_ids"]
                 del batch["label_ids"]
+            # print(batch)
+            batch["pos_labels"] = torch.Tensor(pos_labels)
 
             return batch
         

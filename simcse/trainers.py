@@ -89,7 +89,12 @@ from filelock import FileLock
 logger = logging.get_logger(__name__)
 
 class CLTrainer(Trainer):
-
+    def update_annealed_weight(self, model, step, max_steps):
+        model.annealed_weight = (math.tanh(
+            (step - max_steps * 1.5) /
+            (max_steps / 3))
+            + 1) * 1
+        
     def evaluate(
         self,
         eval_dataset: Optional[Dataset] = None,
@@ -242,7 +247,85 @@ class CLTrainer(Trainer):
             # Maybe delete some older checkpoints.
             if self.is_world_process_zero():
                 self._rotate_checkpoints(use_mtime=True)
-    
+    # Joey: need to overload compute_loss,
+    def compute_loss(self, model, inputs, return_outputs=False, conbine_losses=True):
+        """
+        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+        Subclass and override for custom behavior.
+        """
+        if self.label_smoother is not None and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+        outputs = model(**inputs)
+        # Save past state if it exists
+        # TODO: this needs to be fixed and made cleaner later.
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        if labels is not None:
+            loss = self.label_smoother(outputs, labels)
+        else:
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+            style_adversarial_loss = outputs['style_adversarial_loss']
+            content_adversarial_loss = outputs['content_adversarial_loss']
+
+        if conbine_losses:
+            return (loss+style_adversarial_loss+content_adversarial_loss, outputs) if return_outputs else loss+style_adversarial_loss+content_adversarial_loss
+        else:
+            return (loss, style_adversarial_loss, content_adversarial_loss, outputs) if return_outputs else (loss, style_adversarial_loss, content_adversarial_loss)
+
+    # Joey: need to overload training_step, because output of model.forward is changed.
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        """
+        Perform a training step on a batch of inputs.
+        Subclass and override to inject custom behavior.
+        Args:
+            model (`nn.Module`):
+                The model to train.
+            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument `labels`. Check your model's documentation for all accepted arguments.
+        Return:
+            `torch.Tensor`: The tensor with training loss on this batch.
+        """
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        # if is_sagemaker_mp_enabled():
+        #     scaler = self.scaler if self.do_grad_scaling else None
+        #     loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps, scaler=scaler)
+        #     return loss_mb.reduce_mean().detach().to(self.args.device)
+
+        # with self.autocast_smart_context_manager():
+        loss, style_adversarial_loss, content_adversarial_loss = self.compute_loss(model, inputs, conbine_losses=False)
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+        if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
+            # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
+            loss = loss / self.args.gradient_accumulation_steps
+        
+        # if self.do_grad_scaling:
+        self.scaler.scale(style_adversarial_loss).backward(retain_graph=True)
+        self.scaler.scale(content_adversarial_loss).backward(retain_graph=True)
+        self.scaler.scale(loss).backward()
+        # elif self.use_apex:
+        #     with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+        #         scaled_loss.backward()
+        # elif self.deepspeed:
+        #     # loss gets scaled under gradient_accumulation_steps in deepspeed
+        #     loss = self.deepspeed.backward(loss)
+        # else:
+        #     style_adversarial_loss.backward(retain_graph=True)
+        #     content_adversarial_loss.backward(retain_graph=True)
+        #     loss.backward()
+
+        return loss.detach() + style_adversarial_loss.detach() + style_adversarial_loss.detach()
+
     def train(self, model_path: Optional[str] = None, trial: Union["optuna.Trial", Dict[str, Any]] = None):
         """
         Main training entry point.
@@ -452,7 +535,7 @@ class CLTrainer(Trainer):
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
                     continue
-
+                self.update_annealed_weight(model, step, len(epoch_iterator)*num_train_epochs)
                 if (step + 1) % self.args.gradient_accumulation_steps == 0:
                     self.control = self.callback_handler.on_step_begin(self.args, self.state, self.control)
 

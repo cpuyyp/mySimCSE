@@ -14,7 +14,43 @@ from transformers.file_utils import (
     add_start_docstrings_to_model_forward,
     replace_return_docstrings,
 )
-from transformers.modeling_outputs import SequenceClassifierOutput, BaseModelOutputWithPoolingAndCrossAttentions
+from transformers.modeling_outputs import BaseModelOutputWithPoolingAndCrossAttentions
+# from transformers.modeling_outputs import SequenceClassifierOutput, BaseModelOutputWithPoolingAndCrossAttentions
+from transformers.file_utils import ModelOutput
+from dataclasses import dataclass, field
+from typing import Optional, Union, List, Dict, Tuple
+
+@dataclass
+class MyBaseModelOutputWithPoolingAndCrossAttentions(BaseModelOutputWithPoolingAndCrossAttentions):
+     style_emb: torch.FloatTensor = None
+     content_emb: torch.FloatTensor = None
+
+# Joey: redefine the output to suit my needs
+@dataclass
+class SequenceClassifierOutput(ModelOutput):
+    """
+    Base class for outputs of sentence classification models.
+    Args:
+        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+            Classification (or regression if config.num_labels==1) loss.
+        logits (`torch.FloatTensor` of shape `(batch_size, config.num_labels)`):
+            Classification (or regression if config.num_labels==1) scores (before SoftMax).
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings + one for the output of each layer)
+            of shape `(batch_size, sequence_length, hidden_size)`.
+            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
+        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length, sequence_length)`.
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+    """
+
+    loss: Optional[torch.FloatTensor] = None
+    style_adversarial_loss: Optional[torch.FloatTensor] = None
+    content_adversarial_loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
 
 class MLPLayer(nn.Module):
     """
@@ -32,6 +68,83 @@ class MLPLayer(nn.Module):
 
         return x
 
+class DisentangleLayer(nn.Module):
+    """
+    Joey: Head after pooler for divide style and content informatino into 
+    two seperate embeddings.
+    """
+
+    def __init__(self, config, model_args):
+        super().__init__()
+        # consider more ways to disentangle.
+        # if config.disentangle_type ==  '':
+        self.dense2style = nn.Linear(config.hidden_size, model_args.style_size)
+        self.activation_style = nn.Tanh()
+        self.dense2content = nn.Linear(config.hidden_size, model_args.content_size)
+        self.activation_content = nn.Tanh()
+
+    def forward(self, features, **kwargs):
+        style_emb = self.dense2style(features)
+        style_emb = self.activation_style(style_emb)
+        content_emb = self.dense2content(features)
+        content_emb = self.activation_style(content_emb)
+        return (style_emb, content_emb)
+
+class StyleClassifier(nn.Module):
+    """
+    Joey: use style embedding to predict POS frequency vector
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.style_size, config.POS_vocab_size)
+        self.activation = nn.ReLU()
+    def forward(self, style_emb, **kwargs):
+        POS_vec = self.dense(style_emb)
+        POS_vec = self.activation(POS_vec)
+        return POS_vec
+
+class ContentClassifier(nn.Module):
+    """
+    Joey: use content embedding to predict BOW frequency vector
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.content_size, config.BOW_vocab_size)
+        self.activation = nn.ReLU()
+    def forward(self, content_emb, **kwargs):
+        BOW_vec = self.dense(content_emb)
+        BOW_vec = self.activation(BOW_vec)
+        return BOW_vec
+
+class StyleAdversary(nn.Module):
+    """
+    Joey: use content embedding to predict POS frequency vector to provide adversarial loss
+    Detach to prevent gradients flow back to bert
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.content_size, config.POS_vocab_size)
+        self.activation = nn.ReLU()
+    def forward(self, content_emb, **kwargs):
+        POS_vec = self.dense(content_emb.detach())
+        POS_vec = self.activation(POS_vec)
+        return POS_vec
+    
+class ContentAdversary(nn.Module):
+    """
+    Joey: use style embedding to predict BOW frequency vector to provide adversarial loss
+    Detach to prevent gradients flow back to bert
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.style_size, config.BOW_vocab_size)
+        self.activation = nn.ReLU()
+    def forward(self, style_emb, **kwargs):
+        BOW_vec = self.dense(style_emb.detach())
+        BOW_vec = self.activation(BOW_vec)
+        return BOW_vec
+
+        
 class Similarity(nn.Module):
     """
     Dot product or cosine similarity
@@ -89,11 +202,31 @@ def cl_init(cls, config):
     """
     cls.pooler_type = cls.model_args.pooler_type
     cls.pooler = Pooler(cls.model_args.pooler_type)
+    cls.label_smoothing = cls.model_args.label_smoothing
+    cls.BOW_vocab_size = cls.model_args.BOW_vocab_size
+    cls.POS_vocab_size = cls.model_args.POS_vocab_size
+    cls.epsilon = cls.model_args.epsilon
     if cls.model_args.pooler_type == "cls":
         cls.mlp = MLPLayer(config)
     cls.sim = Similarity(temp=cls.model_args.temp)
+    cls.disentangleLayer = DisentangleLayer(config, cls.model_args)
+    cls.styleClassifier = StyleClassifier(cls.model_args)
+    cls.contentClassifier = ContentClassifier(cls.model_args)
+    cls.styleAdversary = StyleAdversary(cls.model_args)
+    cls.contentAdversary = ContentAdversary(cls.model_args)
+    cls.annealed_weight = 1
     cls.init_weights()
+    # return cls
 
+def get_entropy_loss(preds, epsilon):
+    """
+    Returns the entropy loss: negative of the entropy present in the
+    input distribution
+    Note: this is already the negative
+    """
+    return torch.mean(torch.sum(preds * torch.log(preds + epsilon), dim=1))
+
+# Joey: the training forward
 def cl_forward(cls,
     encoder,
     input_ids=None,
@@ -108,6 +241,8 @@ def cl_forward(cls,
     return_dict=None,
     mlm_input_ids=None,
     mlm_labels=None,
+    pos_labels = None,
+    bow_labels = None,
 ):
     return_dict = return_dict if return_dict is not None else cls.config.use_return_dict
     ori_input_ids = input_ids
@@ -117,9 +252,21 @@ def cl_forward(cls,
     num_sent = input_ids.size(1)
 
     mlm_outputs = None
+
+    # Joey: construct BOW feature from input_ids
+    bow_labels = torch.zeros(batch_size,1, cls.BOW_vocab_size)
+    for irow in range(batch_size):
+        for jcol in input_ids[irow,0]:
+            bow_labels[irow,0,jcol] += 1
+    bow_labels = torch.cat((bow_labels,bow_labels), 1)
+
+    # convert to probability for CrossEntropyLoss
+    bow_labels = bow_labels.softmax(dim=(2))
+    pos_labels = pos_labels.softmax(dim=(2))
+
     # Flatten input for encoding
     input_ids = input_ids.view((-1, input_ids.size(-1))) # (bs * num_sent, len)
-    attention_mask = attention_mask.view((-1, attention_mask.size(-1))) # (bs * num_sent len)
+    attention_mask = attention_mask.view((-1, attention_mask.size(-1))) # (bs * num_sent, len)
     if token_type_ids is not None:
         token_type_ids = token_type_ids.view((-1, token_type_ids.size(-1))) # (bs * num_sent, len)
 
@@ -157,10 +304,53 @@ def cl_forward(cls,
 
     # If using "cls", we add an extra MLP layer
     # (same as BERT's original implementation) over the representation.
+    # Joey: Why don't put cls pooler insider the pooler class??
+    # Joey: Because model_args.mlp_only_train. 
+    # During evaluation, using only the CLS as sentence embedding may be better?
     if cls.pooler_type == "cls":
         pooler_output = cls.mlp(pooler_output)
 
-    # Separate representation
+    # construct bow_feature from input_ids
+
+    # Joey: Separate style and content
+    # Start calculate some loss
+    # why pos loads 2xbatch size ????
+    
+    # smoothed_bow_labels = bow_labels * (1-cls.label_smoothing) + cls.label_smoothing/cls.BOW_vocab_size
+    # smoothed_pos_labels = pos_labels * (1-cls.label_smoothing) + cls.label_smoothing/cls.POS_vocab_size
+    smoothed_bow_labels = bow_labels 
+    smoothed_pos_labels = pos_labels 
+    
+    style_emb, content_emb = cls.disentangleLayer(pooler_output)
+    pos_pred = cls.styleClassifier(style_emb)
+    bow_pred = cls.contentClassifier(content_emb)
+
+    pos_pred_adv = cls.styleAdversary(content_emb)
+    bow_pred_adv = cls.contentAdversary(style_emb)
+
+    softmax_loss_fct = nn.Softmax(dim=1)
+    style_entropy_loss = get_entropy_loss(softmax_loss_fct(pos_pred_adv), cls.epsilon)
+    content_entropy_loss = get_entropy_loss(softmax_loss_fct(bow_pred_adv), cls.epsilon)
+
+
+    crossentropy_loss_fct = nn.CrossEntropyLoss()
+    smoothed_pos_labels = smoothed_pos_labels.view(pos_pred.shape)
+    # print(smoothed_pos_labels.shape)
+    # print(pos_pred.shape)
+    # smoothed_pos_labels = smoothed_pos_labels[:,0,:]
+    smoothed_pos_labels = smoothed_pos_labels.to(cls.device) 
+    smoothed_bow_labels = smoothed_bow_labels.to(cls.device) 
+
+    # mse_loss_fct = nn.MSELoss()
+
+    style_classifier_loss = crossentropy_loss_fct(pos_pred, smoothed_pos_labels)
+    content_classifier_loss = crossentropy_loss_fct(bow_pred, smoothed_bow_labels)
+
+    style_adversarial_loss = crossentropy_loss_fct(pos_pred_adv, smoothed_pos_labels)
+    content_adversarial_loss = crossentropy_loss_fct(bow_pred_adv, smoothed_bow_labels)
+
+
+    # Separate sentence representation
     z1, z2 = pooler_output[:,0], pooler_output[:,1]
 
     # Hard negative
@@ -191,14 +381,14 @@ def cl_forward(cls,
         z1 = torch.cat(z1_list, 0)
         z2 = torch.cat(z2_list, 0)
 
-    cos_sim = cls.sim(z1.unsqueeze(1), z2.unsqueeze(0))
+    cos_sim = cls.sim(z1.unsqueeze(1), z2.unsqueeze(0)) # (bs * bs)
     # Hard negative
     if num_sent >= 3:
         z1_z3_cos = cls.sim(z1.unsqueeze(1), z3.unsqueeze(0))
         cos_sim = torch.cat([cos_sim, z1_z3_cos], 1)
 
-    labels = torch.arange(cos_sim.size(0)).long().to(cls.device)
-    loss_fct = nn.CrossEntropyLoss()
+    labels = torch.arange(cos_sim.size(0)).long().to(cls.device) # [0,1,2, ... bs-1]
+    # loss_fct = nn.CrossEntropyLoss()
 
     # Calculate loss with hard negatives
     if num_sent == 3:
@@ -209,13 +399,22 @@ def cl_forward(cls,
         ).to(cls.device)
         cos_sim = cos_sim + weights
 
-    loss = loss_fct(cos_sim, labels)
+    # Joey: Why loss(cos_sim, labels)?
+    # Joey: labels is array([0,1,2,...,bs-1]). cos_sim has shape (bs * bs). 
+    # In the two columns case, take the ith sentence in the first column, 
+    # we use crossentropy to classify which sentence in the second column match it.
+    # And it's the ith. Because both of them are the same sentence but different runs.
+    loss = crossentropy_loss_fct(cos_sim, labels) \
+                + 1*cls.annealed_weight * style_classifier_loss \
+                + 1*cls.annealed_weight * content_classifier_loss \
+                + 1*cls.annealed_weight * style_entropy_loss \
+                + 1*cls.annealed_weight * content_entropy_loss
 
     # Calculate loss for MLM
     if mlm_outputs is not None and mlm_labels is not None:
         mlm_labels = mlm_labels.view(-1, mlm_labels.size(-1))
         prediction_scores = cls.lm_head(mlm_outputs.last_hidden_state)
-        masked_lm_loss = loss_fct(prediction_scores.view(-1, cls.config.vocab_size), mlm_labels.view(-1))
+        masked_lm_loss = crossentropy_loss_fct(prediction_scores.view(-1, cls.config.vocab_size), mlm_labels.view(-1))
         loss = loss + cls.model_args.mlm_weight * masked_lm_loss
 
     if not return_dict:
@@ -223,12 +422,14 @@ def cl_forward(cls,
         return ((loss,) + output) if loss is not None else output
     return SequenceClassifierOutput(
         loss=loss,
+        style_adversarial_loss = style_adversarial_loss,
+        content_adversarial_loss = content_adversarial_loss,
         logits=cos_sim,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
     )
 
-
+# Joey: the evaluating forward
 def sentemb_forward(
     cls,
     encoder,
@@ -259,14 +460,20 @@ def sentemb_forward(
     )
 
     pooler_output = cls.pooler(attention_mask, outputs)
+    
+
     if cls.pooler_type == "cls" and not cls.model_args.mlp_only_train:
         pooler_output = cls.mlp(pooler_output)
+
+    style_emb, content_emb = cls.disentangleLayer(pooler_output)
 
     if not return_dict:
         return (outputs[0], pooler_output) + outputs[2:]
 
-    return BaseModelOutputWithPoolingAndCrossAttentions(
+    return MyBaseModelOutputWithPoolingAndCrossAttentions(
         pooler_output=pooler_output,
+        style_emb=style_emb,
+        content_emb=content_emb,
         last_hidden_state=outputs.last_hidden_state,
         hidden_states=outputs.hidden_states,
     )
@@ -299,6 +506,8 @@ class BertForCL(BertPreTrainedModel):
         sent_emb=False,
         mlm_input_ids=None,
         mlm_labels=None,
+        pos_labels = None,
+        bow_labels = None,
     ):
         if sent_emb:
             return sentemb_forward(self, self.bert,
@@ -327,6 +536,8 @@ class BertForCL(BertPreTrainedModel):
                 return_dict=return_dict,
                 mlm_input_ids=mlm_input_ids,
                 mlm_labels=mlm_labels,
+                pos_labels = pos_labels,
+                bow_labels = bow_labels,
             )
 
 
@@ -358,6 +569,8 @@ class RobertaForCL(RobertaPreTrainedModel):
         sent_emb=False,
         mlm_input_ids=None,
         mlm_labels=None,
+        pos_labels = None,
+        bow_labels = None,
     ):
         if sent_emb:
             return sentemb_forward(self, self.roberta,
@@ -386,4 +599,6 @@ class RobertaForCL(RobertaPreTrainedModel):
                 return_dict=return_dict,
                 mlm_input_ids=mlm_input_ids,
                 mlm_labels=mlm_labels,
+                pos_labels = pos_labels,
+                bow_labels = bow_labels,
             )
