@@ -1,3 +1,9 @@
+## Joey's readme
+
+This is a prototype of my disertation work that I am still working on. I am trying to unsupervisly learn a style embedding for each sentence. The basic idea is to apply the constrastve learning techenique from SimCSE onto style embedding learning. Besides, adversarial training is applied as well, to enforce the style and content information are disentangled.
+
+
+
 ## SimCSE: Simple Contrastive Learning of Sentence Embeddings
 
 This repository contains the code and pre-trained models for our paper [SimCSE: Simple Contrastive Learning of Sentence Embeddings](https://arxiv.org/abs/2104.08821).
